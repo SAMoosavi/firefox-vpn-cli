@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""Command-line client for the Firefox VPN desktop app's local API."""
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_ADDRESS = "127.0.0.1:10820"
+DEFAULT_TIMEOUT = 30
+POWER_TIMEOUT = 180
+POLL_INTERVAL = 0.5
+SIGNIN_TIMEOUT = 15 * 60
+NEED_STEPS = {"need_email_code", "need_unblock_code", "need_totp", "need_captcha", "need_email_link"}
+warned_plain_http = False
+
+
+class FfvpnError(Exception):
+    """A message meant for the person running ffvpn."""
+
+
+# --- data folder and dashboard address -------------------------------------
+
+
+def default_data_dir():
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(xdg, "firefox-vpn-client")
+
+
+def find_data_dir(explicit=None):
+    first = explicit or os.environ.get("FFVPN_DATA_DIR")
+    # An explicit folder is authoritative: never fall back to the real app's
+    # data when the person named another folder.
+    if first:
+        return first
+    for directory in (default_data_dir(), "/opt/firefox-vpn/user-data"):
+        if os.access(os.path.join(directory, "local-api.token"), os.R_OK):
+            return directory
+    # Keep the message stable when nothing is found: name the usual folder.
+    return default_data_dir()
+
+
+def read_token(data_dir):
+    with open(os.path.join(data_dir, "local-api.token"), encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def parse_listen(listen):
+    if not isinstance(listen, str):
+        return DEFAULT_ADDRESS
+    listen = listen.strip()
+    host, sep, port = listen.rpartition(":")
+    if not sep or not port.isdigit():
+        return DEFAULT_ADDRESS
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    # A wildcard listen address is not a usable URL host.
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
+def dashboard_address(data_dir):
+    try:
+        with open(os.path.join(data_dir, "config.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        listen = (config.get("dashboard") or {}).get("listen")
+        return parse_listen(listen)
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_ADDRESS
+
+
+def warn_plain_http(address):
+    global warned_plain_http
+    host = address.rpartition(":")[0].strip("[]").lower()
+    if warned_plain_http or host in ("127.0.0.1", "localhost", "::1"):
+        return
+    warned_plain_http = True
+    print(
+        f"ffvpn: warning: talking to {address} over plain HTTP; "
+        "the local API token is sent unencrypted",
+        file=sys.stderr,
+    )
+
+
+# --- HTTP -------------------------------------------------------------------
+
+
+class Api:
+    def __init__(self, base, token, timeout=DEFAULT_TIMEOUT):
+        self.base = base.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+        # The machine may carry http_proxy; a local API call must never use it.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _request(self, method, path, body=None, timeout=None):
+        headers = {"X-Local-Token": self.token}
+        data = None
+        if method != "GET":
+            # The dashboard rejects any non-GET without this with HTTP 415.
+            headers["Content-Type"] = "application/json"
+            if body is None and method == "POST":
+                body = {}
+            if body is not None:
+                data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            self.base + path, data=data, headers=headers, method=method
+        )
+        try:
+            with self.opener.open(request, timeout=timeout or self.timeout) as response:
+                raw = response.read()
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as error:
+            raw = error.read()
+            message = None
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    message = payload.get("error")
+            except ValueError:
+                pass
+            if not message:
+                message = f"HTTP {error.code} {error.reason}".strip()
+            raise FfvpnError(str(message))
+        except ValueError:
+            raise FfvpnError(f"unexpected response from {self.base}")
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            raise FfvpnError(
+                f"cannot reach {self.base}: {reason}; is the Firefox VPN app running?"
+            )
+
+    def get(self, path):
+        return self._request("GET", path)
+
+    def post(self, path, body=None, timeout=None):
+        return self._request("POST", path, body, timeout)
+
+    def delete(self, path):
+        return self._request("DELETE", path)
+
+
+def make_api(args):
+    directory = find_data_dir(args.data_dir)
+    try:
+        token = read_token(directory)
+    except OSError:
+        raise FfvpnError(
+            f"no local API token in {directory}; is the Firefox VPN app running?"
+        )
+    address = dashboard_address(directory)
+    warn_plain_http(address)
+    return Api("http://" + address, token)
+
+
+# --- formatting -------------------------------------------------------------
+
+
+def human_bytes(value):
+    if value is None:
+        return "-"
+    number = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(number) < 1024 or unit == "TB":
+            return f"{number:.1f} {unit}"
+        number /= 1024
+
+
+def shorten(text, width=24):
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def print_table(headers, rows):
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(str(cell)))
+    for row in [headers] + rows:
+        line = "  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row))
+        print(line.rstrip())
+
+
+def yes_no(value):
+    return "yes" if value else "no"
+
+
+# --- resolution -------------------------------------------------------------
+
+
+def resolve_location(value, locations):
+    if value is None:
+        return "fastest"
+    text = value.strip()
+    lowered = text.lower()
+    if lowered in ("", "recommended", "rec", "auto"):
+        return ""
+    if lowered == "fastest":
+        return "fastest"
+
+    codes = {str(location.get("code", "")).upper() for location in locations}
+    if len(lowered) == 2:
+        code = lowered.upper()
+        if code in codes:
+            return code
+        raise FfvpnError(f"unknown location {text!r}; run 'ffvpn ls' to see locations")
+
+    matches = [
+        location
+        for location in locations
+        if lowered in str(location.get("name", "")).lower()
+        or lowered in str(location.get("city", "")).lower()
+    ]
+    if len(matches) == 1:
+        return str(matches[0].get("code", "")).upper()
+    if not matches:
+        raise FfvpnError(f"unknown location {text!r}; run 'ffvpn ls' to see locations")
+    names = ", ".join(
+        f"{str(m.get('code', '')).upper()} ({m.get('name') or m.get('city') or '?'})"
+        for m in matches
+    )
+    raise FfvpnError(f"location {text!r} is ambiguous: {names}")
+
+
+def resolve_account(value, accounts):
+    text = value.strip()
+    for account in accounts:
+        if str(account.get("id", "")) == text:
+            return account
+    lowered = text.lower()
+    for account in accounts:
+        if str(account.get("email", "")).lower() == lowered:
+            return account
+    matches = [
+        account
+        for account in accounts
+        if lowered in str(account.get("email", "")).lower()
+        or lowered in str(account.get("name", "")).lower()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FfvpnError(f"no account matches {text!r}")
+    names = ", ".join(str(m.get("email") or m.get("id")) for m in matches)
+    raise FfvpnError(f"account {text!r} is ambiguous: {names}")
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def wait_for_phase(api, wanted, stop=(), timeout=None, match=None):
+    """Poll /api/status until the phase settles; return the last status."""
+    timeout = POWER_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        status = api.get("/api/status")
+        phase = (status.get("state") or {}).get("phase")
+        if (
+            (phase == wanted and (match is None or match(status)))
+            or phase in stop
+            or time.monotonic() >= deadline
+        ):
+            return status
+        time.sleep(POLL_INTERVAL)
+
+
+def cmd_connect(args):
+    api = make_api(args)
+    locations = api.get("/api/locations").get("locations") or []
+    country = resolve_location(args.location, locations)
+
+    if args.tun:
+        status = api.get("/api/status")
+        if not status.get("tun_supported"):
+            raise FfvpnError("TUN mode is not supported on this system")
+
+    # Resolve first, then mode, then selection, then connect.
+    if args.system_proxy:
+        api.post("/api/system-proxy", {"mode": "set"})
+    if args.proxy:
+        api.post("/api/system-proxy", {"mode": "clear"})
+    if args.tun:
+        api.post("/api/system-proxy", {"mode": "tun"})
+
+    api.post("/api/location", {"country": country})
+    api.post("/api/power", {"on": True}, timeout=POWER_TIMEOUT)
+
+    # Power on returns at once; the engine reports the real phase later. After a
+    # location change the old engine can still report "running" with the new
+    # selection, so a concrete country must also show up on the proxy.
+    wanted = country if country and country != "fastest" else None
+    match = None
+    if wanted:
+        code = wanted.upper()
+
+        def match(status, code=code):
+            proxy = status.get("proxy") or {}
+            return str(proxy.get("country_code") or "").upper() == code
+
+    status = wait_for_phase(api, "running", ("error", "waiting", "off"), match=match)
+    state = status.get("state") or {}
+    proxy = status.get("proxy") or {}
+    name = status.get("selection_name") or (country if country else "recommended")
+
+    print(f"state: {state.get('message') or state.get('phase') or 'unknown'}")
+    print(f"location: {name}")
+    if proxy.get("listen"):
+        print(f"proxy: {proxy['listen']}")
+    exit_info = status.get("exit") or {}
+    if exit_info.get("ipv4"):
+        place = ", ".join(
+            part for part in (exit_info.get("city"), exit_info.get("country_name")) if part
+        )
+        print(f"exit: {exit_info['ipv4']}" + (f" ({place})" if place else ""))
+    account = status.get("active_account") or {}
+    if account.get("email"):
+        print(f"account: {account['email']}")
+
+    if state.get("phase") != "running":
+        raise FfvpnError(
+            state.get("message") or f"the VPN is {state.get('phase') or 'not running'}"
+        )
+    if match is not None and not match(status):
+        in_use = str(proxy.get("country_code") or "").upper() or "unknown"
+        print(f"ffvpn: warning: the proxy is still using {in_use}", file=sys.stderr)
+    return 0
+
+
+def cmd_disconnect(args):
+    api = make_api(args)
+    api.post("/api/power", {"on": False}, timeout=POWER_TIMEOUT)
+    status = wait_for_phase(api, "off", ("error",))
+    state = status.get("state") or {}
+    if state.get("phase") != "off":
+        raise FfvpnError(state.get("message") or "the VPN did not disconnect")
+    print(state.get("message") or "disconnected")
+    return 0
+
+
+def cmd_ls(args):
+    api = make_api(args)
+    locations = api.get("/api/locations").get("locations") or []
+
+    if args.codes:
+        print(" ".join(str(location.get("code", "")) for location in locations))
+        return 0
+
+    try:
+        status = api.get("/api/status")
+    except FfvpnError:
+        status = {}
+    selection = status.get("selection") or ""
+    # "fastest" is resolved to a country only once connected; until then the
+    # running proxy's country is the best hint for which row is in use.
+    if selection == "fastest":
+        selected = str((status.get("proxy") or {}).get("country_code") or "").upper()
+    else:
+        selected = selection.upper()
+
+    has_ping = any("ping_ms" in location for location in locations)
+    headers = ["", "CODE", "NAME", "CITY"] + (["PING"] if has_ping else [])
+    rows = []
+    for location in locations:
+        code = str(location.get("code", "")).upper()
+        marked = code == selected or (
+            selection == "" and (location.get("recommended") or code == "REC")
+        )
+        row = [
+            ">" if marked else " ",
+            code,
+            location.get("name") or "-",
+            location.get("city") or "-",
+        ]
+        if has_ping:
+            if location.get("ping_ms") is not None:
+                row.append(f"{location['ping_ms']} ms")
+            elif location.get("ping_error"):
+                row.append(shorten(location["ping_error"]))
+            else:
+                row.append("-")
+        rows.append(row)
+    print_table(headers, rows)
+    return 0
+
+
+def account_views(api):
+    return api.get("/api/accounts").get("accounts") or []
+
+
+def cmd_account_ls(args):
+    api = make_api(args)
+    accounts = account_views(api)
+    if args.names:
+        for account in accounts:
+            print(account.get("email") or account.get("id"))
+        return 0
+    rows = [
+        [
+            account.get("id") or "-",
+            account.get("email") or "-",
+            account.get("position") if account.get("position") is not None else "-",
+            account.get("status") or "-",
+            yes_no(account.get("active")),
+            yes_no(account.get("enabled")),
+        ]
+        for account in accounts
+    ]
+    print_table(["ID", "EMAIL", "POS", "STATUS", "ACTIVE", "ENABLED"], rows)
+    return 0
+
+
+def cmd_account_usage(args):
+    api = make_api(args)
+    rows = []
+    for account in account_views(api):
+        usage = account.get("usage")
+        if not usage:
+            rows.append([account.get("email") or "-", "-", "-", "-", "-", "-"])
+            continue
+        limit = usage.get("limit_bytes")
+        remaining = usage.get("remaining_bytes")
+        used = limit - remaining if limit is not None and remaining is not None else None
+        percent = account.get("used_percent")
+        if isinstance(percent, (int, float)):
+            percent = f"{percent:.1f}%"
+        else:
+            percent = "-"
+        reset = str(usage.get("reset_at") or "").split("T")[0] or "-"
+        rows.append(
+            [
+                account.get("email") or "-",
+                human_bytes(used),
+                human_bytes(limit),
+                human_bytes(remaining),
+                percent,
+                reset,
+            ]
+        )
+    print_table(["EMAIL", "USED", "LIMIT", "LEFT", "USED%", "RESETS"], rows)
+    return 0
+
+
+def cmd_account_set(args):
+    api = make_api(args)
+    account = resolve_account(args.account, account_views(api))
+    api.post(f"/api/accounts/{urllib.parse.quote(str(account['id']), safe='')}/activate")
+    print(account.get("email") or account.get("id"))
+    return 0
+
+
+def confirm(text):
+    print(text, end="", file=sys.stderr, flush=True)
+    try:
+        answer = input()
+    except EOFError:
+        answer = ""
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_account_logout(args):
+    api = make_api(args)
+    accounts = account_views(api)
+    if args.account:
+        account = resolve_account(args.account, accounts)
+    elif not accounts:
+        raise FfvpnError("no accounts; sign in with 'ffvpn account login'")
+    elif len(accounts) == 1:
+        account = accounts[0]
+    else:
+        raise FfvpnError(
+            "more than one account; name the account to remove (see 'ffvpn account ls')"
+        )
+
+    email = account.get("email") or account.get("id")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise FfvpnError(
+                f"refusing to remove {email} without confirmation; pass --yes"
+            )
+        if not confirm(f"Remove {email} and its stored tokens? [y/N] "):
+            print("cancelled", file=sys.stderr)
+            return 1
+
+    api.delete(f"/api/accounts/{urllib.parse.quote(str(account['id']), safe='')}")
+    print(f"Removed {email}")
+    return 0
+
+
+def ask(text):
+    print(text, end="", file=sys.stderr, flush=True)
+    if sys.stdin.isatty():
+        try:
+            return input().strip()
+        except EOFError:
+            raise FfvpnError("no input")
+    line = sys.stdin.readline()
+    if not line:
+        raise FfvpnError("no input")
+    return line.strip()
+
+
+def read_password():
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass("Password: ")
+        except EOFError:
+            raise FfvpnError("no password")
+    line = sys.stdin.readline()
+    if not line:
+        raise FfvpnError("no password on stdin")
+    return line.rstrip("\n")
+
+
+def save_captcha(data_uri):
+    encoded = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+    try:
+        raw = base64.b64decode(encoded)
+    except ValueError:
+        raise FfvpnError("the app sent an unreadable CAPTCHA image")
+    handle, path = tempfile.mkstemp(prefix="ffvpn-captcha-", suffix=".png")
+    with os.fdopen(handle, "wb") as f:
+        f.write(raw)
+    return path
+
+
+def cmd_account_login(args):
+    api = make_api(args)
+
+    email = args.email
+    if not email:
+        email = ask("Firefox Account email: ")
+    if not email:
+        raise FfvpnError("an email address is required")
+    password = read_password()
+
+    view = api.post("/api/signin", {"email": email, "password": password})
+    signin_id = view.get("id")
+    if not signin_id:
+        raise FfvpnError("the app did not return a sign-in id")
+
+    path = f"/api/signin/{urllib.parse.quote(str(signin_id), safe='')}"
+    deadline = time.monotonic() + SIGNIN_TIMEOUT
+    last_message = None
+    prompted = None
+    captchas = []
+
+    try:
+        while True:
+            step = view.get("step") or ""
+            message = view.get("message") or ""
+            error = view.get("error") or ""
+
+            if (step, message) != last_message:
+                if message:
+                    print(message, file=sys.stderr)
+                last_message = (step, message)
+
+            if step == "done":
+                print(f"Added {view.get('email') or email}")
+                return 0
+            if step in ("failed", "cancelled"):
+                raise FfvpnError(error or message or f"sign-in {step}")
+
+            # A re-issued CAPTCHA keeps the same step/message/error but replaces
+            # the image, so the image identity belongs in the prompt key too.
+            key = (
+                step,
+                error,
+                message,
+                view.get("updated"),
+                len(view.get("captcha") or ""),
+            )
+            if step in NEED_STEPS and key != prompted:
+                prompted = key
+                if error:
+                    print(error, file=sys.stderr)
+                if step == "need_captcha":
+                    image = save_captcha(view.get("captcha") or "")
+                    captchas.append(image)
+                    print(f"CAPTCHA image: {image}", file=sys.stderr)
+                    opener = shutil.which("xdg-open")
+                    if opener:
+                        try:
+                            subprocess.run(
+                                [opener, image],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=5,
+                            )
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+                    value = ask("Characters in the image: ")
+                elif step == "need_email_link":
+                    ask("Press Enter once you opened the link")
+                    value = ""
+                else:
+                    labels = {
+                        "need_email_code": "Email code: ",
+                        "need_unblock_code": "Unblock code: ",
+                        "need_totp": "Authentication code: ",
+                    }
+                    value = ask(labels[step])
+                view = api.post(path, {"value": value})
+                continue
+
+            if time.monotonic() > deadline:
+                raise FfvpnError("sign-in timed out")
+            time.sleep(1)
+            view = api.get(path)
+    except (KeyboardInterrupt, Exception) as error:
+        # Leaving the server-side session alive would block a retry for 15 min.
+        try:
+            api.delete(path)
+        except FfvpnError:
+            pass
+        if isinstance(error, KeyboardInterrupt):
+            print("cancelled", file=sys.stderr)
+            return 130
+        raise
+    finally:
+        for image in captchas:
+            try:
+                os.unlink(image)
+            except OSError:
+                pass
+
+
+# --- completions ------------------------------------------------------------
+
+BASH_COMPLETION = """\
+_ffvpn() {
+    local cur sub locs accounts i=1
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    while [[ "${COMP_WORDS[i]}" == "-d" || "${COMP_WORDS[i]}" == "--data-dir" ]]; do
+        i=$((i + 2))
+    done
+    sub="${COMP_WORDS[i]}"
+    case "$sub" in
+        connect)
+            locs="$(ffvpn ls --codes 2>/dev/null)"
+            COMPREPLY=( $(compgen -W "fastest recommended $locs --proxy --system-proxy --tun" -- "$cur") )
+            ;;
+        account)
+            case "${COMP_WORDS[i + 1]}" in
+                set|logout)
+                    accounts="$(ffvpn account ls --names 2>/dev/null)"
+                    COMPREPLY=( $(compgen -W "$accounts" -- "$cur") )
+                    ;;
+                *)
+                    COMPREPLY=( $(compgen -W "ls usage set logout login" -- "$cur") )
+                    ;;
+            esac
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash fish" -- "$cur") )
+            ;;
+        *)
+            COMPREPLY=( $(compgen -W "connect disconnect ls account completion" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _ffvpn ffvpn
+"""
+
+FISH_COMPLETION = """\
+complete -c ffvpn -f
+complete -c ffvpn -n '__fish_use_subcommand' -a connect -d 'Connect'
+complete -c ffvpn -n '__fish_use_subcommand' -a disconnect -d 'Disconnect'
+complete -c ffvpn -n '__fish_use_subcommand' -a ls -d 'List locations'
+complete -c ffvpn -n '__fish_use_subcommand' -a account -d 'Manage accounts'
+complete -c ffvpn -n '__fish_use_subcommand' -a completion -d 'Print shell completion'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -a '(ffvpn ls --codes 2>/dev/null)'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -a fastest -d 'Fastest location'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -a recommended -d 'Recommended location'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -l proxy -d 'Local proxy only'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -l system-proxy -d 'GNOME system proxy'
+complete -c ffvpn -n '__fish_seen_subcommand_from connect' -l tun -d 'TUN mode'
+complete -c ffvpn -n '__fish_seen_subcommand_from account; and not __fish_seen_subcommand_from ls usage set logout login' -a 'ls usage set logout login'
+complete -c ffvpn -n '__fish_seen_subcommand_from account; and __fish_seen_subcommand_from set logout' -a '(ffvpn account ls --names 2>/dev/null)'
+complete -c ffvpn -n '__fish_seen_subcommand_from completion' -a 'bash fish'
+"""
+
+
+def completion_script(shell):
+    return BASH_COMPLETION if shell == "bash" else FISH_COMPLETION
+
+
+def cmd_completion(args):
+    print(completion_script(args.shell), end="")
+    return 0
+
+
+# --- argument parsing -------------------------------------------------------
+
+
+def add_data_dir(parser):
+    # SUPPRESS keeps a value parsed before the subcommand from being reset.
+    parser.add_argument(
+        "-d",
+        "--data-dir",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="data folder (default: auto-detect)",
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ffvpn",
+        description="Command-line client for the Firefox VPN desktop app.",
+    )
+    parser.add_argument(
+        "-d", "--data-dir", metavar="DIR", help="data folder (default: auto-detect)"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    connect = commands.add_parser("connect", help="Connect to a location.")
+    add_data_dir(connect)
+    connect.add_argument(
+        "location", nargs="?", help="location, code, or name (default: fastest)"
+    )
+    modes = connect.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--proxy", action="store_true", help="local proxy only (no system proxy)"
+    )
+    modes.add_argument(
+        "--system-proxy", action="store_true", help="set the GNOME system proxy"
+    )
+    modes.add_argument("--tun", action="store_true", help="use TUN mode")
+    connect.set_defaults(func=cmd_connect)
+
+    disconnect = commands.add_parser("disconnect", help="Disconnect the VPN.")
+    add_data_dir(disconnect)
+    disconnect.set_defaults(func=cmd_disconnect)
+
+    ls = commands.add_parser("ls", help="List locations.")
+    add_data_dir(ls)
+    ls.add_argument("--codes", action="store_true", help="print codes only")
+    ls.set_defaults(func=cmd_ls)
+
+    account = commands.add_parser("account", help="Manage accounts.")
+    add_data_dir(account)
+    account_commands = account.add_subparsers(dest="account_command", required=True)
+
+    account_ls = account_commands.add_parser("ls", help="List accounts.")
+    add_data_dir(account_ls)
+    account_ls.add_argument(
+        "--names", action="store_true", help="print one account name per line"
+    )
+    account_ls.set_defaults(func=cmd_account_ls)
+
+    account_usage = account_commands.add_parser("usage", help="Show account usage.")
+    add_data_dir(account_usage)
+    account_usage.set_defaults(func=cmd_account_usage)
+
+    account_set = account_commands.add_parser("set", help="Switch the active account.")
+    add_data_dir(account_set)
+    account_set.add_argument("account", help="account id, email, or name")
+    account_set.set_defaults(func=cmd_account_set)
+
+    account_logout = account_commands.add_parser(
+        "logout", help="Remove an account and its stored tokens."
+    )
+    add_data_dir(account_logout)
+    account_logout.add_argument("account", nargs="?", help="account id, email, or name")
+    account_logout.add_argument(
+        "--yes", action="store_true", help="do not ask for confirmation"
+    )
+    account_logout.set_defaults(func=cmd_account_logout)
+
+    account_login = account_commands.add_parser("login", help="Sign in to an account.")
+    add_data_dir(account_login)
+    account_login.add_argument("email", nargs="?", help="Firefox Account email")
+    account_login.set_defaults(func=cmd_account_login)
+
+    completion = commands.add_parser("completion", help="Print a shell completion script.")
+    add_data_dir(completion)
+    completion.add_argument("shell", choices=["bash", "fish"], help="shell to complete")
+    completion.set_defaults(func=cmd_completion)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except FfvpnError as error:
+        print(f"ffvpn: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        # The CLI should never show a traceback to the person running it.
+        print(f"ffvpn: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
