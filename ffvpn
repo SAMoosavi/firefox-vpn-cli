@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command-line client for the Firefox VPN desktop app's local API."""
+"""Command-line client for the Arman VPN desktop app's local API."""
 
 import argparse
 import base64
@@ -33,7 +33,7 @@ class FfvpnError(Exception):
 
 def default_data_dir():
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(xdg, "firefox-vpn-client")
+    return os.path.join(xdg, "arman-vpn")
 
 
 def find_data_dir(explicit=None):
@@ -42,7 +42,7 @@ def find_data_dir(explicit=None):
     # data when the person named another folder.
     if first:
         return first
-    for directory in (default_data_dir(), "/opt/firefox-vpn/user-data"):
+    for directory in (default_data_dir(), "/opt/arman-vpn/user-data"):
         if os.access(os.path.join(directory, "local-api.token"), os.R_OK):
             return directory
     # Keep the message stable when nothing is found: name the usual folder.
@@ -139,7 +139,7 @@ class Api:
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             reason = getattr(error, "reason", error)
             raise FfvpnError(
-                f"cannot reach {self.base}: {reason}; is the Firefox VPN app running?"
+                f"cannot reach {self.base}: {reason}; is the Arman VPN app running?"
             )
 
     def get(self, path):
@@ -158,7 +158,7 @@ def make_api(args):
         token = read_token(directory)
     except OSError:
         raise FfvpnError(
-            f"no local API token in {directory}; is the Firefox VPN app running?"
+            f"no local API token in {directory}; is the Arman VPN app running?"
         )
     address = dashboard_address(directory)
     warn_plain_http(address)
@@ -719,7 +719,7 @@ def add_data_dir(parser):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ffvpn",
-        description="Command-line client for the Firefox VPN desktop app.",
+        description="Command-line client for the Arman VPN desktop app.",
     )
     parser.add_argument(
         "-d", "--data-dir", metavar="DIR", help="data folder (default: auto-detect)"

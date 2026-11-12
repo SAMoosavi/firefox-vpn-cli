@@ -1197,7 +1197,7 @@ class DataDirAuthorityTest(unittest.TestCase):
 
     def make_default_with_token(self):
         xdg = self.make_dir(token=False)
-        default = os.path.join(xdg, "firefox-vpn-client")
+        default = os.path.join(xdg, "arman-vpn")
         os.makedirs(default)
         with open(os.path.join(default, "local-api.token"), "w", encoding="utf-8") as f:
             f.write("secret\n")

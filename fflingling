@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""Run opencode through the Arman VPN, rotating countries on a rate limit."""
+
+import argparse
+import itertools
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+
+MITM_HOSTS = ("opencode.ai",)
+RETRYABLE = frozenset({429, 502, 503, 504})
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 300
+CLIENT_TIMEOUT = 300
+MAX_BODY = 64 * 1024 * 1024
+
+
+class FflinglingError(Exception):
+    """A message meant for the person running fflingling."""
+
+
+class BodyTooLarge(Exception):
+    """A request body exceeded MAX_BODY."""
+
+
+# --- places ----------------------------------------------------------------
+
+
+def data_dir():
+    explicit = os.environ.get("FFLINGLING_DATA_DIR")
+    if explicit:
+        return explicit
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(xdg, "fflingling")
+
+
+def ffvpn_data_dir():
+    explicit = os.environ.get("FFVPN_DATA_DIR")
+    if explicit:
+        return explicit
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    default = os.path.join(xdg, "arman-vpn")
+    for directory in (default, "/opt/arman-vpn/user-data"):
+        if os.access(os.path.join(directory, "local-api.token"), os.R_OK):
+            return directory
+    return default
+
+
+def proxy_address():
+    path = os.path.join(ffvpn_data_dir(), "config.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        raise FflinglingError(
+            f"cannot read {path}; is the Arman VPN app running?"
+        )
+    listen = (config.get("proxy") or {}).get("listen")
+    if not isinstance(listen, str) or ":" not in listen:
+        raise FflinglingError(f"no proxy.listen in {path}")
+    host, _, port = listen.strip().rpartition(":")
+    if not port.isdigit():
+        raise FflinglingError(f"unreadable proxy.listen {listen!r} in {path}")
+    host = host.strip("[]")
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    return host, int(port)
+
+
+def find_ffvpn():
+    found = shutil.which("ffvpn")
+    if found:
+        return found
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffvpn")
+    return sibling if os.access(sibling, os.X_OK) else None
+
+
+# --- ffvpn -----------------------------------------------------------------
+
+
+def _run_ffvpn(binary, *args, timeout=300, with_stderr=False):
+    try:
+        result = subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise FflinglingError(f"cannot run {binary}: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise FflinglingError(detail[-1] if detail else f"ffvpn {args[0]} failed")
+    if with_stderr:
+        return result.stdout, result.stderr
+    return result.stdout
+
+
+def list_countries(binary):
+    codes = []
+    for code in _run_ffvpn(binary, "ls", "--codes", timeout=60).split():
+        code = code.upper()
+        # REC is the recommended marker, not a country, and it resolves to ""
+        # and would leave the first rotation on the address already in use.
+        if len(code) == 2 and code.isalpha():
+            codes.append(code)
+    if not codes:
+        raise FflinglingError("ffvpn reported no locations")
+    return codes
+
+
+def connect_country(binary, code):
+    _, stderr = _run_ffvpn(
+        binary, "connect", "--proxy", code, with_stderr=True
+    )
+    if "the proxy is still using" in stderr:
+        raise FflinglingError(f"ffvpn did not move to {code}")
+
+
+# --- certificates ----------------------------------------------------------
+
+
+def _openssl(binary, args):
+    try:
+        result = subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise FflinglingError(f"openssl failed: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise FflinglingError(
+            f"openssl failed: {detail[-1] if detail else result.returncode}"
+        )
+
+
+def ensure_certs(directory):
+    """Create the local CA and opencode leaf once; reuse them afterwards."""
+    ca_cert = os.path.join(directory, "ca.pem")
+    ca_key = os.path.join(directory, "ca-key.pem")
+    leaf_cert = os.path.join(directory, "leaf.pem")
+    leaf_key = os.path.join(directory, "leaf-key.pem")
+    if all(os.path.exists(path) for path in (ca_cert, ca_key, leaf_cert, leaf_key)):
+        return ca_cert, leaf_cert, leaf_key
+    binary = shutil.which("openssl")
+    if binary is None:
+        raise FflinglingError("openssl not found on PATH")
+    os.makedirs(directory, exist_ok=True, mode=0o700)
+    csr = os.path.join(directory, "leaf.csr")
+    ext = os.path.join(directory, "leaf.ext")
+    try:
+        _openssl(binary, [
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-batch",
+            "-keyout", ca_key, "-out", ca_cert, "-days", "3650",
+            "-subj", "/CN=fflingling local CA",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        ])
+        with open(ext, "w", encoding="utf-8") as handle:
+            handle.write(
+                "basicConstraints=critical,CA:FALSE\n"
+                "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\n"
+                "subjectAltName=DNS:opencode.ai,DNS:*.opencode.ai\n"
+            )
+        _openssl(binary, [
+            "req", "-newkey", "rsa:2048", "-nodes", "-batch",
+            "-keyout", leaf_key, "-out", csr, "-subj", "/CN=opencode.ai",
+        ])
+        _openssl(binary, [
+            "x509", "-req", "-in", csr, "-CA", ca_cert, "-CAkey", ca_key,
+            "-CAcreateserial", "-out", leaf_cert, "-days", "825",
+            "-extfile", ext,
+        ])
+    finally:
+        for path in (csr, ext):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    for path in (ca_key, leaf_key):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return ca_cert, leaf_cert, leaf_key
+
+
+def server_context(cert, key):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    return context
+
+
+# --- HTTP bits -------------------------------------------------------------
+
+
+def retryable(status):
+    return status in RETRYABLE
+
+
+def is_mitm_host(host):
+    host = (host or "").lower().rstrip(".")
+    if host in MITM_HOSTS:
+        return True
+    # The leaf SAN is *.opencode.ai, so only one label below the apex matches.
+    for name in MITM_HOSTS:
+        prefix = host[: -len(name) - 1] if host.endswith("." + name) else ""
+        if prefix and "." not in prefix:
+            return True
+    return False
+
+
+def rotation_order(pool, current):
+    if current in pool:
+        index = pool.index(current)
+        return list(pool[index + 1:]) + list(pool[:index])
+    return list(pool)
+
+
+def next_country(pool, current):
+    order = rotation_order(pool, current)
+    return order[0] if order else None
+
+
+def headers_of(head):
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        if b":" in line:
+            name, value = line.split(b":", 1)
+            headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def parse_head(head):
+    try:
+        status = int(head.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        status = 0
+    return status, headers_of(head)
+
+
+def force_close(head):
+    """Keep the head's order, drop proxy-only headers, force Connection: close."""
+    headers = headers_of(head)
+    chunked = b"chunked" in headers.get(b"transfer-encoding", b"").lower()
+    lines = head.split(b"\r\n")
+    out = [lines[0]]
+    closed = False
+    for line in lines[1:]:
+        if not line:
+            continue
+        name = line.split(b":", 1)[0].strip().lower()
+        if name in (b"expect", b"proxy-connection"):
+            continue
+        if chunked and name == b"content-length":
+            continue
+        if name == b"connection":
+            out.append(b"Connection: close")
+            closed = True
+        else:
+            out.append(line)
+    if not closed:
+        out.append(b"Connection: close")
+    return b"\r\n".join(out) + b"\r\n\r\n"
+
+
+def read_head(sock, timeout=None):
+    if timeout is not None:
+        sock.settimeout(timeout)
+    buf = bytearray()
+    while not buf.endswith(b"\r\n\r\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        buf += chunk
+        if len(buf) > 65536:
+            return None
+    return bytes(buf)
+
+
+def recv_exact(sock, size):
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def recv_line(sock):
+    line = bytearray()
+    while not line.endswith(b"\r\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        line += chunk
+    return bytes(line)
+
+
+def chunk_size(line):
+    try:
+        return int(line.strip().split(b";")[0], 16)
+    except ValueError:
+        return None
+
+
+def read_body(sock, headers):
+    """Buffer a request body verbatim, or None if the client closed early."""
+    if b"chunked" in headers.get(b"transfer-encoding", b"").lower():
+        return read_chunked(sock)
+    length = headers.get(b"content-length")
+    if length is None:
+        return b""
+    try:
+        size = int(length)
+    except ValueError:
+        return b""
+    if size > MAX_BODY:
+        raise BodyTooLarge
+    body = recv_exact(sock, size)
+    return body if len(body) == size else None
+
+
+def read_chunked(sock):
+    out = bytearray()
+    while True:
+        line = recv_line(sock)
+        if line is None:
+            return None
+        out += line
+        size = chunk_size(line)
+        if size is None:
+            return None
+        if size == 0:
+            while True:
+                tail = recv_line(sock)
+                if tail is None:
+                    return None
+                out += tail
+                if tail == b"\r\n":
+                    return bytes(out)
+        if len(out) + size + 2 > MAX_BODY:
+            raise BodyTooLarge
+        data = recv_exact(sock, size + 2)
+        out += data
+        if len(data) < size + 2:
+            return None
+
+
+def pump_exact(source, target, size):
+    sent = 0
+    while sent < size:
+        chunk = source.recv(min(65536, size - sent))
+        if not chunk:
+            break
+        target.sendall(chunk)
+        sent += len(chunk)
+    return sent
+
+
+def pump_chunked(source, target):
+    sent = 0
+    while True:
+        line = recv_line(source)
+        if line is None:
+            return sent
+        target.sendall(line)
+        sent += len(line)
+        size = chunk_size(line)
+        if size is None:
+            return sent
+        if size == 0:
+            while True:
+                tail = recv_line(source)
+                if tail is None:
+                    return sent
+                target.sendall(tail)
+                sent += len(tail)
+                if tail == b"\r\n":
+                    return sent
+        data = recv_exact(source, size + 2)
+        if not data:
+            return sent
+        target.sendall(data)
+        sent += len(data)
+        if len(data) < size + 2:
+            return sent
+
+
+def pump_eof(source, target):
+    sent = 0
+    while True:
+        chunk = source.recv(65536)
+        if not chunk:
+            return sent
+        target.sendall(chunk)
+        sent += len(chunk)
+
+
+# --- log -------------------------------------------------------------------
+
+
+def stamp():
+    return time.strftime("%H:%M:%S")
+
+
+def human_bytes(value):
+    number = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if number < 1024 or unit == "GB":
+            return f"{number:.1f} {unit}"
+        number /= 1024
+
+
+class Log:
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def write(self, line):
+        with self._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError:
+                pass
+
+
+# --- the proxy -------------------------------------------------------------
+
+
+class Relay:
+    """CONNECT proxy: MITM opencode.ai, blind-tunnel everything else."""
+
+    def __init__(self, proxy_address, pool, country=None, log=None, mitm=True,
+                 server_context=None, connect=None, connect_country=None,
+                 connect_proxy=None, retries=3, rotate_wait=120.0):
+        self.proxy_address = proxy_address
+        self.pool = list(dict.fromkeys(pool))
+        self.country = country or (self.pool[0] if self.pool else "")
+        self.log = log or Log(os.devnull)
+        self.mitm = mitm
+        self.server_context = server_context
+        self.connect = connect or self._vpn_connect
+        self.connect_country = connect_country or (lambda code: None)
+        self.connect_proxy = connect_proxy or (
+            lambda: socket.create_connection(
+                self.proxy_address, timeout=CONNECT_TIMEOUT
+            )
+        )
+        self.retries = max(0, retries)
+        self.rotate_wait = max(0.0, rotate_wait)
+        self._seq = itertools.count(1)
+        self._cond = threading.Condition()
+        self._generation = 0
+        self._inflight = 0
+        self._blocked = 0
+        self._rotating = False
+        self._sock = None
+        self._port = 0
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(64)
+        self._sock = sock
+        self._port = sock.getsockname()[1]
+        threading.Thread(
+            target=self._accept, name="fflingling-accept", daemon=True
+        ).start()
+        return self._port
+
+    def stop(self):
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _accept(self):
+        while True:
+            sock = self._sock
+            if sock is None:
+                return
+            try:
+                client, _ = sock.accept()
+            except OSError:
+                # One aborted opencode connection must not kill the proxy.
+                if self._sock is None:
+                    return
+                time.sleep(0.05)
+                continue
+            except Exception as error:
+                self.log.write(f"{stamp()} accept loop failed: {error}")
+                return
+            threading.Thread(
+                target=self.handle, args=(client,), daemon=True
+            ).start()
+
+    # -- one client ---------------------------------------------------------
+
+    def handle(self, client):
+        try:
+            client.settimeout(CLIENT_TIMEOUT)
+            head = read_head(client, CLIENT_TIMEOUT)
+            if head is None:
+                return
+            try:
+                method, target, _ = (
+                    head.split(b"\r\n", 1)[0].decode("latin1").split(" ", 2)
+                )
+            except ValueError:
+                self._answer(client, b"400 Bad Request")
+                return
+            if method.upper() != "CONNECT":
+                self._handle_plain(client, head)
+                return
+            host, _, port = target.rpartition(":")
+            if not port.isdigit():
+                self._answer(client, b"400 Bad Request")
+                return
+            host = host.strip("[]")
+            port = int(port)
+            if self.mitm and self.server_context is not None and is_mitm_host(host):
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self._handle_mitm(client, host, port)
+            else:
+                self._handle_tunnel(client, host, port)
+        except Exception as error:
+            # A daemon thread must never let a traceback reach the TUI.
+            self.log.write(f"{stamp()} connection failed: {error}")
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _answer(client, status):
+        if isinstance(status, bytes):
+            status = status.decode("latin1")
+        client.sendall(
+            f"HTTP/1.1 {status}\r\nConnection: close\r\n"
+            f"Content-Length: 0\r\n\r\n".encode("latin1")
+        )
+
+    def _handle_mitm(self, client, host, port):
+        try:
+            tls = self.server_context.wrap_socket(client, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        try:
+            self._serve_request(tls, host, port)
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def _handle_tunnel(self, client, host, port):
+        try:
+            upstream = self.connect(host, port, False)
+        except (OSError, FflinglingError):
+            self._answer(client, b"502 Bad Gateway")
+            return
+        try:
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            upstream.settimeout(READ_TIMEOUT)
+            self._pipe(client, upstream)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def _handle_plain(self, client, head):
+        """Forward a non-CONNECT (absolute-URI) request through the VPN proxy."""
+        try:
+            upstream = self.connect_proxy()
+        except (OSError, FflinglingError):
+            self._answer(client, b"502 Bad Gateway")
+            return
+        try:
+            upstream.settimeout(READ_TIMEOUT)
+            upstream.sendall(head)
+            self._pipe(client, upstream)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def _pipe(self, client, upstream):
+        def copy(source, target):
+            try:
+                while True:
+                    data = source.recv(65536)
+                    if not data:
+                        break
+                    target.sendall(data)
+            except OSError:
+                pass
+            except Exception as error:
+                self.log.write(f"{stamp()} pipe stopped: {error}")
+            finally:
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except (OSError, AttributeError):
+                    pass
+
+        thread = threading.Thread(
+            target=copy, args=(upstream, client), daemon=True
+        )
+        thread.start()
+        copy(client, upstream)
+        thread.join(5)
+
+    # -- one request --------------------------------------------------------
+
+    def _serve_request(self, client, host, port):
+        seq = next(self._seq)
+        upstream = None
+        entered = False
+        try:
+            head = read_head(client, CLIENT_TIMEOUT)
+            if head is None:
+                return
+            # Count as in-flight only once there is a request: an idle pooled
+            # connection must not hold up a rotation.
+            self._enter()
+            entered = True
+            try:
+                method, path, _ = (
+                    head.split(b"\r\n", 1)[0].decode("latin1").split(" ", 2)
+                )
+            except ValueError:
+                self._answer(client, b"400 Bad Request")
+                return
+            headers = headers_of(head)
+            if b"100-continue" in headers.get(b"expect", b"").lower():
+                client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            try:
+                body = read_body(client, headers)
+            except BodyTooLarge:
+                self._answer(client, b"413 Payload Too Large")
+                return
+            if body is None:
+                # The client vanished mid-body: never forward a short body
+                # under the original Content-Length.
+                try:
+                    self._answer(client, b"400 Bad Request")
+                except OSError:
+                    pass
+                return
+            started = time.monotonic()
+            seen = self._seen()
+            old = self.country
+            try:
+                status, upstream, response_head = self._attempt(
+                    host, port, head, body
+                )
+            except (OSError, FflinglingError) as error:
+                self._bad_gateway(client, seq, old, host, path, error)
+                return
+            replays = 0
+            while status in RETRYABLE and replays < self.retries:
+                moved, new, performed = self._rotate(old, seen)
+                if performed:
+                    target = new if moved else "no other country"
+                    self.log.write(
+                        f"{stamp()} #{seq} {{{old}}} {status} -> rotate "
+                        f"{old} -> {target}"
+                    )
+                if not moved:
+                    break
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+                upstream = None
+                replays += 1
+                old = new
+                seen = self._seen()
+                try:
+                    status, upstream, response_head = self._attempt(
+                        host, port, head, body
+                    )
+                except (OSError, FflinglingError) as error:
+                    self._bad_gateway(client, seq, old, host, path, error)
+                    return
+            size = self._deliver(client, upstream, response_head, method, status)
+            elapsed = time.monotonic() - started
+            self.log.write(
+                f"{stamp()} #{seq} {{{self.country}}} {status} {host} {path} "
+                f"{human_bytes(size)} {elapsed:.1f}s"
+            )
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+            if entered:
+                self._leave()
+
+    def _attempt(self, host, port, head, body):
+        upstream = self.connect(host, port, True)
+        try:
+            upstream.settimeout(READ_TIMEOUT)
+            upstream.sendall(force_close(head))
+            if body:
+                upstream.sendall(body)
+            response_head = read_head(upstream, READ_TIMEOUT)
+            while response_head is not None:
+                # 1xx is interim: an early hint or continue must not become
+                # the answer, or a 429 behind it would never be seen.
+                interim = parse_head(response_head)[0]
+                if not 100 <= interim < 200:
+                    break
+                response_head = read_head(upstream, READ_TIMEOUT)
+            if response_head is None:
+                raise FflinglingError("the origin closed without a response")
+            return parse_head(response_head)[0], upstream, response_head
+        except Exception:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+            raise
+
+    def _deliver(self, client, upstream, head, method, status):
+        client.sendall(force_close(head))
+        if method.upper() == "HEAD" or status in (204, 304):
+            return 0
+        headers = headers_of(head)
+        if b"chunked" in headers.get(b"transfer-encoding", b"").lower():
+            return pump_chunked(upstream, client)
+        length = headers.get(b"content-length")
+        if length is not None:
+            try:
+                size = int(length)
+            except ValueError:
+                size = 0
+            return pump_exact(upstream, client, size)
+        return pump_eof(upstream, client)
+
+    def _bad_gateway(self, client, seq, country, host, path, error):
+        try:
+            self._answer(client, b"502 Bad Gateway")
+        except OSError:
+            pass
+        self.log.write(
+            f"{stamp()} #{seq} {{{country}}} 502 {host} {path} 0.0 B 0.0s "
+            f"({error})"
+        )
+
+    # -- rotation -----------------------------------------------------------
+
+    def _seen(self):
+        with self._cond:
+            return self._generation
+
+    def _enter(self):
+        with self._cond:
+            while self._rotating:
+                self._cond.wait()
+            self._inflight += 1
+
+    def _leave(self):
+        with self._cond:
+            self._inflight -= 1
+            self._cond.notify_all()
+
+    def _rotate(self, current, seen):
+        performed = False
+        with self._cond:
+            self._blocked += 1
+            self._cond.notify_all()
+            try:
+                while True:
+                    if self._generation != seen:
+                        return self.country != current, self.country, performed
+                    if not self._rotating:
+                        break
+                    self._cond.wait()
+                self._rotating = True
+                performed = True
+                deadline = time.monotonic() + self.rotate_wait
+                while self._inflight - self._blocked > 0:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        waiting = self._inflight - self._blocked
+                        self.log.write(
+                            f"{stamp()} {{{self.country}}} rotation is waiting "
+                            f"for {waiting} in-flight request(s); gave up after "
+                            f"{self.rotate_wait:g}s"
+                        )
+                        break
+                    self._cond.wait(min(left, 1.0))
+            finally:
+                self._blocked -= 1
+        moved = False
+        new = self.country
+        for code in rotation_order(self.pool, current):
+            try:
+                self.connect_country(code)
+            except Exception as error:
+                self.log.write(f"{stamp()} rotation to {code} failed: {error}")
+                continue
+            with self._cond:
+                self.country = code
+            moved = True
+            new = code
+            break
+        with self._cond:
+            self._generation += 1
+            self._rotating = False
+            self._cond.notify_all()
+        return moved, new, performed
+
+    # -- the VPN ------------------------------------------------------------
+
+    def _vpn_connect(self, host, port, tls):
+        raw = self.connect_proxy()
+        try:
+            target = f"{host}:{port}"
+            raw.sendall(
+                f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode(
+                    "latin1"
+                )
+            )
+            head = read_head(raw, CONNECT_TIMEOUT)
+            status = parse_head(head)[0] if head else 0
+            if status != 200:
+                raise FflinglingError(
+                    f"the VPN proxy refused CONNECT {target} with {status}"
+                )
+            if not tls:
+                return raw
+            return ssl.create_default_context().wrap_socket(
+                raw, server_hostname=host
+            )
+        except Exception:
+            raw.close()
+            raise
+
+
+# --- opencode --------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="fflingling",
+        description=(
+            "Run opencode through the Arman VPN. opencode.ai traffic is "
+            "intercepted so a 429 rotates the country and replays the call."
+        ),
+        epilog=(
+            "Everything else is passed to opencode. The Arman VPN app must "
+            "already be signed in."
+        ),
+    )
+    parser.add_argument(
+        "--no-mitm",
+        action="store_true",
+        help="blind tunnel only: do not generate or trust a local CA",
+    )
+    parser.add_argument(
+        "opencode_args",
+        nargs=argparse.REMAINDER,
+        help="arguments passed to opencode",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
+
+
+def opencode_binary():
+    found = shutil.which("opencode")
+    if found is None:
+        raise FflinglingError("opencode not found on PATH")
+    return found
+
+
+def opencode_env(port, ca_pem):
+    env = dict(os.environ)
+    proxy = f"http://127.0.0.1:{port}"
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        env[name] = proxy
+    env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
+    if ca_pem:
+        env["NODE_EXTRA_CA_CERTS"] = ca_pem
+    return env
+
+
+def run_opencode(binary, args, env):
+    code = subprocess.run([binary, *args], env=env).returncode
+    return 128 - code if code < 0 else code
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# --- entry -----------------------------------------------------------------
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    relay = None
+    try:
+        directory = data_dir()
+        os.makedirs(directory, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        log_path = os.path.join(directory, "fflingling.log")
+
+        binary = find_ffvpn()
+        if binary is None:
+            raise FflinglingError("ffvpn not found on PATH or next to fflingling")
+        pool = list_countries(binary)
+        country = os.environ.get("FFLINGLING_COUNTRY") or pool[0]
+        connect_country(binary, country)
+        print(f"fflingling: {country} via ffvpn, log {log_path}", flush=True)
+
+        ca_pem = None
+        context = None
+        if not args.no_mitm:
+            ca_pem, leaf_cert, leaf_key = ensure_certs(directory)
+            context = server_context(leaf_cert, leaf_key)
+
+        relay = Relay(
+            proxy_address(),
+            pool,
+            country=country,
+            log=Log(log_path),
+            mitm=not args.no_mitm,
+            server_context=context,
+            connect_country=lambda code: connect_country(binary, code),
+            retries=env_int("FFLINGLING_RETRIES", 3),
+            rotate_wait=env_float("FFLINGLING_ROTATE_WAIT_S", 120.0),
+        )
+        port = relay.start()
+        env = opencode_env(port, ca_pem)
+        return run_opencode(opencode_binary(), args.opencode_args, env)
+    except FflinglingError as error:
+        print(f"fflingling: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        print(f"fflingling: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if relay is not None:
+            relay.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

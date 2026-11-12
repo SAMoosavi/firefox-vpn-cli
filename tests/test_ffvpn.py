@@ -163,7 +163,7 @@ class DataDirTest(unittest.TestCase):
     def test_explicit_missing_token_does_not_fall_back(self):
         explicit = self.make_dir(token=False)
         xdg = self.make_dir()
-        default = os.path.join(xdg, "firefox-vpn-client")
+        default = os.path.join(xdg, "arman-vpn")
         os.makedirs(default)
         with open(os.path.join(default, "local-api.token"), "w", encoding="utf-8") as f:
             f.write("secret\n")
@@ -178,7 +178,7 @@ class DataDirTest(unittest.TestCase):
     def test_environment_missing_token_does_not_fall_back(self):
         env_dir = self.make_dir(token=False)
         xdg = self.make_dir()
-        default = os.path.join(xdg, "firefox-vpn-client")
+        default = os.path.join(xdg, "arman-vpn")
         os.makedirs(default)
         with open(os.path.join(default, "local-api.token"), "w", encoding="utf-8") as f:
             f.write("secret\n")
@@ -195,7 +195,7 @@ class DataDirTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"XDG_DATA_HOME": xdg, "FFVPN_DATA_DIR": ""}, clear=False
         ):
-            expected = os.path.join(xdg, "firefox-vpn-client")
+            expected = os.path.join(xdg, "arman-vpn")
             os.makedirs(expected)
             with open(os.path.join(expected, "local-api.token"), "w", encoding="utf-8") as f:
                 f.write("secret\n")
@@ -215,7 +215,7 @@ class DataDirTest(unittest.TestCase):
             os.environ, {"XDG_DATA_HOME": xdg, "FFVPN_DATA_DIR": ""}, clear=False
         ):
             self.assertEqual(
-                cli.find_data_dir(None), os.path.join(xdg, "firefox-vpn-client")
+                cli.find_data_dir(None), os.path.join(xdg, "arman-vpn")
             )
 
 

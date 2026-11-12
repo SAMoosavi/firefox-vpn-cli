@@ -1,13 +1,13 @@
 # Local API reference
 
-What `ffvpn` depends on. Verified against the desktop app's core on 2026-11-03
-(upstream `armanlife/firefox-vpn-client`). Nothing here is added or patched upstream.
+What `ffvpn` depends on. Verified against Arman VPN 1.0.18 on 2026-11-12
+(upstream `armanlife/arman-vpn-client`). Nothing here is added or patched upstream.
 
 ## Where it connects
 
 | What | Where |
 |---|---|
-| Data folder | `--data-dir` / `FFVPN_DATA_DIR`, else `$XDG_DATA_HOME/firefox-vpn-client` (usually `~/.local/share/firefox-vpn-client`), else `/opt/firefox-vpn/user-data` |
+| Data folder | `--data-dir` / `FFVPN_DATA_DIR`, else `$XDG_DATA_HOME/arman-vpn` (usually `~/.local/share/arman-vpn`), else `/opt/arman-vpn/user-data` |
 | Token | `local-api.token` in the data folder, sent as `X-Local-Token` |
 | Base URL | `dashboard.listen` from `config.json`, default `127.0.0.1:10820` |
 | Proxy listener | `proxy.listen` in `GET /api/status`, usually `127.0.0.1:10810` |
@@ -71,8 +71,9 @@ the first status read.
 ## Accounts and sign-in
 
 `AccountView`: `id, name, email, position, enabled, active, status, reason,
-reason_code, usage{limit_bytes,remaining_bytes,reset_at,checked_at}, used_percent,
-has_password, device_registered`. `activate` only works on enabled accounts. `DELETE`
+reason_code, usage{unlimited,limit_bytes,remaining_bytes,reset_at,checked_at}, used_percent,
+has_password, device_registered`. `usage.unlimited` is true when the plan has no quota,
+in which case the byte fields are absent. `activate` only works on enabled accounts. `DELETE`
 removes the stored account and its tokens — there is no session-only logout.
 
 `SignInView`: `id, email, step, message, error, error_code, captcha, account_id,
